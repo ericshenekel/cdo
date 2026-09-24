@@ -1,0 +1,355 @@
+name: PR Validate
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, closed]
+    branches: [main]
+
+concurrency:
+  group: pr-validate-${{ github.repository }}-${{ github.event.number }}-${{ github.event.action == 'closed' && 'release' || 'validate' }}
+  cancel-in-progress: ${{ github.event.action != 'closed' }}
+
+permissions:
+  contents: read
+  pull-requests: read
+
+env:
+  ORCHARD_URL: ${{ secrets.ORCHARD_URL }}
+  ORCHARD_CI_TOKEN: ${{ secrets.ORCHARD_CI_TOKEN }}
+
+jobs:
+  validate:
+    if: github.event.action != 'closed'
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    steps:
+      # orchard-salesforce-scope: package-directories-v3
+      # Orchard re-fetches the live PR, complete changed-file list and exact head. It excludes
+      # package-local scripts/data from org deployment and authenticates marker-only scaffold PRs.
+      - name: Classify the exact pull-request revision
+        id: scope
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          PR_NUMBER: ${{ github.event.number }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          payload=$(jq -n \
+            --arg repo "$GITHUB_REPOSITORY" \
+            --argjson prNumber "$PR_NUMBER" \
+            --arg prUrl "$PR_URL" \
+            --arg baseSha "$BASE_SHA" \
+            --arg headSha "$HEAD_SHA" \
+            '{repo:$repo,prNumber:$prNumber,prUrl:$prUrl,baseSha:$baseSha,headSha:$headSha}')
+          response=$(curl --fail-with-body --silent --show-error \
+            --retry 5 --retry-all-errors --retry-delay 3 --max-time 90 \
+            -X POST "$ORCHARD_URL/api/ci/pr-validations/scope" \
+            -H "authorization: Bearer $ORCHARD_CI_TOKEN" \
+            -H "content-type: application/json" \
+            -d "$payload")
+          mode=$(jq -r '.mode // empty' <<<"$response")
+          # jq's `//` treats false as missing, so a boolean must be read with an explicit null check:
+          # every PR that needs no Salesforce validation used to fail here as "invalid".
+          needs_validation=$(jq -r 'if .needsSalesforceValidation == null then empty else (.needsSalesforceValidation | tostring) end' <<<"$response")
+          needs_review=$(jq -r 'if .needsReview == null then empty else (.needsReview | tostring) end' <<<"$response")
+          if [[ ! "$mode" =~ ^(none|orchard_scaffold|actions|salesforce)$ ]] \
+            || [[ ! "$needs_validation" =~ ^(true|false)$ ]] \
+            || [[ ! "$needs_review" =~ ^(true|false)$ ]]; then
+            echo "::error::Orchard returned an invalid PR classification"
+            exit 1
+          fi
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
+          echo "needs_validation=$needs_validation" >> "$GITHUB_OUTPUT"
+          echo "needs_review=$needs_review" >> "$GITHUB_OUTPUT"
+          echo "Orchard PR mode: $mode (Salesforce validation: $needs_validation, Reviewer: $needs_review)"
+
+      - name: Register action-only pull request for Reviewer
+        if: steps.scope.outputs.needs_review == 'true' && steps.scope.outputs.needs_validation == 'false'
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          payload=$(jq -n --arg prUrl "$PR_URL" --arg headSha "$HEAD_SHA" '{prUrl:$prUrl,headSha:$headSha}')
+          curl --fail-with-body --silent --show-error \
+            --retry 5 --retry-all-errors --retry-delay 3 --max-time 90 \
+            -X POST "$ORCHARD_URL/api/ci/review-cycles/ensure" \
+            -H "authorization: Bearer $ORCHARD_CI_TOKEN" \
+            -H "content-type: application/json" \
+            -d "$payload"
+
+      - name: Report action static validation passed
+        if: steps.scope.outputs.needs_review == 'true' && steps.scope.outputs.needs_validation == 'false'
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          payload=$(jq -n \
+            --arg prUrl "$PR_URL" --arg sha "$HEAD_SHA" --arg runUrl "$RUN_URL" \
+            '{prUrl:$prUrl,sha:$sha,conclusion:"pass",runUrl:$runUrl}')
+          curl --fail-with-body --silent --show-error \
+            --retry 5 --retry-all-errors --retry-delay 3 --max-time 90 \
+            -X POST "$ORCHARD_URL/api/ci/results" \
+            -H "authorization: Bearer $ORCHARD_CI_TOKEN" \
+            -H "content-type: application/json" \
+            -d "$payload"
+
+      - name: Announce exact pull-request revision to Orchard
+        if: steps.scope.outputs.needs_validation == 'true'
+        id: announce
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          PR_NUMBER: ${{ github.event.number }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          payload=$(jq -n \
+            --arg repo "$GITHUB_REPOSITORY" \
+            --argjson prNumber "$PR_NUMBER" \
+            --arg prUrl "$PR_URL" \
+            --arg baseSha "$BASE_SHA" \
+            --arg headSha "$HEAD_SHA" \
+            --arg runUrl "$RUN_URL" \
+            '{repo:$repo,prNumber:$prNumber,prUrl:$prUrl,baseSha:$baseSha,headSha:$headSha,runUrl:$runUrl}')
+          response=$(curl --fail-with-body --silent --show-error \
+            --retry 5 --retry-all-errors --retry-delay 3 --max-time 90 \
+            -X POST "$ORCHARD_URL/api/ci/pr-validations" \
+            -H "authorization: Bearer $ORCHARD_CI_TOKEN" \
+            -H "content-type: application/json" \
+            -d "$payload")
+          lane_id=$(jq -r '.laneId // empty' <<<"$response")
+          attempt_id=$(jq -r '.attemptId // empty' <<<"$response")
+          if [ -z "$lane_id" ] || [ -z "$attempt_id" ]; then
+            echo "::error::Orchard did not return a validation lane and attempt"
+            exit 1
+          fi
+          echo "lane_id=$lane_id" >> "$GITHUB_OUTPUT"
+          echo "attempt_id=$attempt_id" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for Orchard prerequisite deployment
+        if: steps.scope.outputs.needs_validation == 'true'
+        env:
+          LANE_ID: ${{ steps.announce.outputs.lane_id }}
+          ATTEMPT_ID: ${{ steps.announce.outputs.attempt_id }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          write_diagnostics() {
+            # The workflow is copied into client repos, so keep its renderer self-contained.
+            write_table() {
+              jq -r --arg format "$format" '
+                def row: "| " + join(" | ") + " |";
+                map(map((. // "—") | tostring | gsub("\t"; " "))) |
+                if $format == "markdown" then
+                  map(map(@html | split("\u005c") | join("&#92;") | gsub("[|]"; "&#124;")
+                    | gsub("`"; "&#96;") | gsub("[*]"; "&#42;") | gsub("_"; "&#95;")
+                    | split("[") | join("&#91;") | split("]") | join("&#93;")
+                    | gsub("~"; "&#126;") | gsub("\r\n|\r|\n"; "<br>"))) |
+                  (.[0] | row), (.[0] | map("---") | row), (.[1:][] | row)
+                else
+                  map(map(gsub("\r\n|\r|\n"; " ↵ "))) as $rows |
+                  ($rows | transpose | map(map(length) | max)) as $widths |
+                  def padded: to_entries | map(.value + (" " * ($widths[.key] - (.value | length)))) | row;
+                  ($rows[0] | padded), ($widths | map("-" * .) | row), ($rows[1:][] | padded)
+                end'
+            }
+            title="$1"
+            target_name=$(jq -r '.diagnostics.target.name // .validationTargetId // "unassigned"' <<<"$response")
+            target_kind=$(jq -r '.diagnostics.target.kind // .validationTargetKind // "unknown"' <<<"$response")
+            salesforce_org_id=$(jq -r '.diagnostics.target.salesforceOrgId // "unknown"' <<<"$response")
+            execution_id=$(jq -r '.diagnostics.executionId // "not created"' <<<"$response")
+            summary=$(jq -r '.diagnostics.summary // .attempt.detail // "No additional detail was reported"' <<<"$response")
+            echo "::group::$title — Orchard diagnostics"
+            render_report() {
+              local format="$1"
+              echo "## $title"
+              echo
+              echo "- **CI org:** \`$target_name\` ($target_kind)"
+              echo "- **Salesforce Org ID:** \`$salesforce_org_id\`"
+              echo "- **PR head:** \`$HEAD_SHA\`"
+              echo "- **Orchard execution:** \`$execution_id\`"
+              echo "- **Failure class:** \`$(jq -r '.diagnostics.failureClass // "unknown"' <<<"$response")\`"
+              echo
+              echo "### Summary"
+              echo '```text'
+              echo "$summary"
+              echo '```'
+              echo
+              echo "### Failed deployment steps"
+              if [ "$(jq '.diagnostics.failedSteps | length' <<<"$response")" -eq 0 ]; then
+                echo "No failed Salesforce deployment step was recorded."
+              else
+                jq '[ ["Phase", "Unit", "Manifest", "Salesforce job", "Error"],
+                  (.diagnostics.failedSteps[] | [.phase, .unitRoot, .manifestRef, .salesforceJobId, (.error // "No step error reported")]) ]' <<<"$response" | write_table
+              fi
+              echo
+              echo "### Component failures"
+              if [ "$(jq '.diagnostics.componentFailures | length' <<<"$response")" -eq 0 ]; then
+                echo "No structured component failure was returned by Salesforce."
+              else
+                jq '[ ["Type", "Component", "File", "Line", "Column", "Error"],
+                  (.diagnostics.componentFailures[] | [(.type // "Component"), (.fullName // "unknown"), .fileName, .line, .column, (.problem // "No component problem reported")]) ]' <<<"$response" | write_table
+              fi
+              echo
+              echo "### Apex test failures"
+              if [ "$(jq '.diagnostics.testFailures | length' <<<"$response")" -eq 0 ]; then
+                echo "No structured Apex test failure was returned by Salesforce."
+              else
+                jq '[ ["Class", "Method", "Error", "Stack trace"],
+                  (.diagnostics.testFailures[] | [(.name // "Test"), (.methodName // "unknown"), (.message // "No test message reported"), (.stackTrace // "Stack trace unavailable")]) ]' <<<"$response" | write_table
+              fi
+            }
+            render_report log
+            render_report markdown >> "$GITHUB_STEP_SUMMARY"
+            echo "::endgroup::"
+            annotation="$summary (CI org: $target_name, execution: $execution_id)"
+            annotation=${annotation//'%'/'%25'}
+            annotation=${annotation//$'\r'/'%0D'}
+            annotation=${annotation//$'\n'/'%0A'}
+            echo "::error title=$title::$annotation"
+          }
+
+          wait_budget_minutes=60
+          deadline=$(( $(date +%s) + wait_budget_minutes * 60 ))
+          # A GitHub-hosted runner bills every minute this loop waits. Orchard's own poller gives up
+          # after about an hour, and a person's park has no deadline at all, so this job never waits
+          # past either: it exits, and Orchard re-runs the workflow when its result is in.
+          while [ "$(date +%s)" -lt "$deadline" ]; do
+            if ! response=$(curl --fail-with-body --silent --show-error \
+                --retry 5 --retry-all-errors --retry-delay 3 --max-time 90 \
+                "$ORCHARD_URL/api/ci/pr-validations/$LANE_ID?attemptId=$ATTEMPT_ID" \
+                -H "authorization: Bearer $ORCHARD_CI_TOKEN"); then
+              echo "::warning::Transient Orchard status read failed; polling will continue"
+              if [ "$(date +%s)" -lt "$deadline" ]; then sleep 30; fi
+              continue
+            fi
+            status=$(jq -r '.status // empty' <<<"$response")
+            returned_attempt=$(jq -r '.attempt.id // empty' <<<"$response")
+            returned_head=$(jq -r '.attempt.headSha // empty' <<<"$response")
+            if [ "$returned_attempt" != "$ATTEMPT_ID" ] || [ "$returned_head" != "$HEAD_SHA" ]; then
+              echo "::error::Orchard returned a different validation attempt or PR head"
+              exit 1
+            fi
+            detail=$(jq -r '.attempt.detail // empty' <<<"$response")
+            case "$status" in
+              passed)
+                echo "Orchard prerequisite deployment passed for $HEAD_SHA"
+                exit 0
+                ;;
+              needs_layout)
+                write_diagnostics "Salesforce source layout approval required"
+                exit 1
+                ;;
+              salesforce_failed)
+                write_diagnostics "Salesforce validation failed"
+                exit 1
+                ;;
+              infra_failed|released)
+                write_diagnostics "Orchard validation operational failure ($status)"
+                exit 1
+                ;;
+              queued)
+                case "$detail" in
+                  needs_org_setup)
+                    write_diagnostics "Orchard is waiting for a person to confirm the validation org is set up; this check re-runs automatically once they confirm"
+                    exit 1
+                    ;;
+                  pr_validation_target_inspection_only)
+                    write_diagnostics "Orchard is waiting for a person to release the held validation org; once released, push or use Redo review to re-run this check"
+                    exit 1
+                    ;;
+                esac
+                if [ "$(date +%s)" -lt "$deadline" ]; then sleep 30; fi
+                ;;
+              running)
+                if [ "$(date +%s)" -lt "$deadline" ]; then sleep 30; fi
+                ;;
+              *)
+                echo "::error::Unexpected Orchard prerequisite status: $status"
+                exit 1
+                ;;
+            esac
+          done
+          echo "::error::Gave up waiting for Orchard after $wait_budget_minutes minutes; Orchard re-runs this check automatically once its validation passes"
+          exit 1
+
+  release:
+    if: github.event.action == 'closed'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Detect Salesforce package changes
+        id: scope
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.number }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          EXPECTED_CHANGED_FILES: ${{ github.event.pull_request.changed_files }}
+        run: |
+          set -euo pipefail
+          project_json=$(gh api \
+            -H "accept: application/vnd.github.raw+json" \
+            "repos/$GITHUB_REPOSITORY/contents/sfdx-project.json?ref=$BASE_SHA")
+          package_paths=$(jq -c '[
+            .packageDirectories[]?.path
+            | sub("^\\./+"; "")
+            | sub("/+$"; "")
+            | if . == "" then "." else . end
+          ] | unique' <<< "$project_json")
+          if [ "$(jq length <<< "$package_paths")" -eq 0 ]; then
+            echo "::error::sfdx-project.json defines no package directories"
+            exit 1
+          fi
+
+          files_json=$(gh api --paginate --slurp \
+            "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/files?per_page=100")
+          fetched_count=$(jq '[.[][]] | length' <<< "$files_json")
+
+          needs_validation=false
+          if [ "$fetched_count" -ne "$EXPECTED_CHANGED_FILES" ]; then
+            echo "::warning::GitHub did not return the complete changed-file list; validation will run safely"
+            needs_validation=true
+          else
+            needs_validation=$(jq -r --argjson packages "$package_paths" '
+              def relative_to($path; $package):
+                if $package == "." then $path
+                elif $path == $package then ""
+                elif ($path | startswith($package + "/")) then $path[($package | length) + 1:]
+                else null end;
+              def is_action($relative):
+                $relative == "scripts" or $relative == "data"
+                or ($relative | startswith("scripts/"))
+                or ($relative | startswith("data/"));
+              [.[][] | .filename, (.previous_filename // empty)] as $paths
+              | any($paths[];
+                  . as $path
+                  | $path == "sfdx-project.json"
+                  or any($packages[];
+                      . as $package
+                      | relative_to($path; $package) as $relative
+                      | $relative != null and (is_action($relative) | not)))
+            ' <<< "$files_json")
+          fi
+
+          echo "needs_validation=$needs_validation" >> "$GITHUB_OUTPUT"
+          if [ "$needs_validation" = "false" ]; then
+            echo "No Salesforce package changes detected; there is no Orchard validation lane to release."
+          fi
+
+      - name: Release Orchard validation lane
+        if: steps.scope.outputs.needs_validation == 'true'
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          PR_NUMBER: ${{ github.event.number }}
+        run: |
+          payload=$(jq -n \
+            --arg repo "$GITHUB_REPOSITORY" \
+            --argjson prNumber "$PR_NUMBER" \
+            --arg prUrl "$PR_URL" \
+            '{repo:$repo,prNumber:$prNumber,prUrl:$prUrl}')
+          curl --fail-with-body --silent --show-error \
+            --retry 5 --retry-all-errors --retry-delay 3 --max-time 90 \
+            -X POST "$ORCHARD_URL/api/ci/pr-validations/release" \
+            -H "authorization: Bearer $ORCHARD_CI_TOKEN" \
+            -H "content-type: application/json" \
+            -d "$payload"

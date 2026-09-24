@@ -1,0 +1,16 @@
+# The agent-readiness devDependencies (eslint, prettier, jest, the Salesforce lint configs) are the
+# repo's verification gates. When they rot, `npm run lint` / `prettier:verify` start failing on
+# rules the pinned versions never had, and an agent run burns budget repairing scaffolding instead
+# of building — the same leak the template itself exists to close. Let Dependabot open the bump PR.
+# Grouped so a month of drift is one review, not thirteen. `patterns: ['*']` deliberately covers
+# every dependency type, not just devDependencies — a repo that later adds runtime deps gets them
+# in the same monthly PR rather than a second stream. Hence the group name is `dependencies`.
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: monthly
+    groups:
+      dependencies:
+        patterns: ['*']

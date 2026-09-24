@@ -1,0 +1,19 @@
+{
+  "packageDirectories": [
+    {
+      "path": "force-app",
+      "default": true
+    }
+  ],
+  "name": "cdo",
+  "namespace": "",
+  "sfdcLoginUrl": "https://login.salesforce.com",
+  "sourceApiVersion": "67.0",
+  "sourceBehaviorOptions": [
+    "decomposeCustomLabelsBeta2",
+    "decomposePermissionSetBeta2",
+    "decomposeSharingRulesBeta",
+    "decomposeWorkflowBeta",
+    "decomposeExternalServiceRegistrationBeta"
+  ]
+}
