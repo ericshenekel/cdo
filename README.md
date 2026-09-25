@@ -11,3 +11,7 @@ Create a scratch org on your machine:
 ```bash
 sf org create scratch --definition-file config/project-scratch-def.json --alias cdo --target-dev-hub <your Dev Hub alias>
 ```
+
+## CI
+
+Pull requests to `main` run Orchard validation via `.github/workflows/pr-validate.yml` (secrets `ORCHARD_URL`, `ORCHARD_CI_TOKEN`).
